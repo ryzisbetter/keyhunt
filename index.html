@@ -1,0 +1,407 @@
+/* ============================================================
+   KeyHunt frontend controller
+   ============================================================ */
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+
+const state = {
+  kind: 'both',
+  amount: 10,
+  raw: [],        // full result set from backend
+  filtered: [],   // after filters/sort
+  sort: 'price',
+  trustedOnly: false,
+  priceMin: null,
+  priceMax: null,
+  evtSource: null,
+};
+
+// ---- rotating status flavor text per stage ----
+const STATUS_TEXT = {
+  collecting: [
+    'Reaching out to supported marketplaces…',
+    'Pulling publicly available listings…',
+    'Gathering live inventory…',
+  ],
+  checking: [
+    'Validating current prices…',
+    'Filtering out-of-stock items…',
+    'Normalizing currencies…',
+  ],
+  reviews: [
+    'Reading buyer reviews…',
+    'Scoring seller reputation…',
+    'Detecting trustworthy sources…',
+  ],
+  ranking: [
+    'Weighing price against trust…',
+    'Sorting from lowest to highest…',
+    'Surfacing the best value…',
+  ],
+  finalizing: ['Assembling your results…', 'Almost there…'],
+};
+let statusTimer = null;
+
+// =================== INIT ===================
+init();
+
+async function init() {
+  bindSearchControls();
+  bindResultsControls();
+  bindTheme();
+  await loadSources();
+  await loadStages();
+}
+
+function bindTheme() {
+  const root = document.documentElement;
+  const icon = $('.theme-icon');
+  $('#themeToggle').addEventListener('click', () => {
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    icon.textContent = next === 'dark' ? '☾' : '☀';
+  });
+}
+
+function bindSearchControls() {
+  // segmented kind
+  $$('#kindSeg .seg').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      $$('#kindSeg .seg').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.kind = btn.dataset.kind;
+    })
+  );
+
+  // amount range
+  const range = $('#amountRange');
+  range.addEventListener('input', () => {
+    state.amount = +range.value;
+    $('#amountPill').textContent = range.value;
+  });
+
+  // quick tags
+  $$('.tag').forEach((t) =>
+    t.addEventListener('click', () => {
+      $('#gameInput').value = t.textContent;
+      runSearch();
+    })
+  );
+
+  $('#searchBtn').addEventListener('click', runSearch);
+  $('#gameInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') runSearch();
+  });
+}
+
+function bindResultsControls() {
+  $('#backBtn').addEventListener('click', () => showView('search'));
+
+  $$('#sortOptions .sort-opt').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      $$('#sortOptions .sort-opt').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.sort = btn.dataset.sort;
+      applyFilters();
+    })
+  );
+
+  $('#trustedOnly').addEventListener('change', (e) => {
+    state.trustedOnly = e.target.checked;
+    applyFilters();
+  });
+  $('#priceMin').addEventListener('input', (e) => {
+    state.priceMin = e.target.value ? +e.target.value : null;
+    applyFilters();
+  });
+  $('#priceMax').addEventListener('input', (e) => {
+    state.priceMax = e.target.value ? +e.target.value : null;
+    applyFilters();
+  });
+  $('#resetFilters').addEventListener('click', () => {
+    state.trustedOnly = false;
+    state.priceMin = state.priceMax = null;
+    $('#trustedOnly').checked = false;
+    $('#priceMin').value = $('#priceMax').value = '';
+    applyFilters();
+  });
+}
+
+async function loadSources() {
+  try {
+    const res = await fetch('/api/sources');
+    const sources = await res.json();
+    const list = $('#sourcesList');
+    list.innerHTML = sources
+      .map(
+        (s, i) => `
+      <div class="source-chip" style="animation-delay:${i * 50}ms">
+        <span class="source-chip-icon">${s.icon}</span>
+        <span>${s.name}</span>
+        <span class="source-chip-access">${formatAccess(s.access)}</span>
+      </div>`
+      )
+      .join('');
+  } catch (e) {
+    /* sources strip is non-critical */
+  }
+}
+
+let STAGES = [];
+async function loadStages() {
+  try {
+    const res = await fetch('/api/stages');
+    STAGES = await res.json();
+  } catch (e) {
+    STAGES = [
+      { stage: 'collecting', label: 'Collecting listings' },
+      { stage: 'checking', label: 'Checking prices' },
+      { stage: 'reviews', label: 'Reading reviews' },
+      { stage: 'ranking', label: 'Ranking results' },
+      { stage: 'finalizing', label: 'Finalizing' },
+    ];
+  }
+}
+
+function formatAccess(a) {
+  return { public_api: 'API', public_page: 'PUBLIC', affiliate: 'PARTNER' }[a] || a;
+}
+
+// =================== SEARCH FLOW ===================
+function runSearch() {
+  const game = $('#gameInput').value.trim();
+  if (!game) {
+    $('#gameInput').focus();
+    $('#searchBtn').animate(
+      [{ transform: 'translateX(0)' }, { transform: 'translateX(-6px)' }, { transform: 'translateX(6px)' }, { transform: 'translateX(0)' }],
+      { duration: 300 }
+    );
+    return;
+  }
+
+  buildLoaderUI(game);
+  showView('loading');
+
+  const params = new URLSearchParams({ game, kind: state.kind, amount: state.amount });
+  if (state.evtSource) state.evtSource.close();
+
+  const es = new EventSource(`/api/search/stream?${params}`);
+  state.evtSource = es;
+
+  es.addEventListener('progress', (e) => {
+    const data = JSON.parse(e.data);
+    updateStage(data);
+  });
+  es.addEventListener('result', (e) => {
+    const data = JSON.parse(e.data);
+    es.close();
+    clearInterval(statusTimer);
+    // Brief beat on 100% before revealing results.
+    setTimeout(() => deliverResults(data), 450);
+  });
+  es.addEventListener('error', () => {
+    es.close();
+    clearInterval(statusTimer);
+    $('#loaderStatus').textContent = 'Something went wrong. Please try again.';
+  });
+}
+
+function buildLoaderUI(game) {
+  $('#loaderTitle').textContent = `Searching for “${game}”`;
+  $('#orbPct').textContent = '0%';
+  $('#progressFill').style.width = '0%';
+
+  $('#stagesList').innerHTML = STAGES.map(
+    (s) => `
+    <li class="stage-item" data-stage="${s.stage}">
+      <span class="stage-dot"></span>
+      <span class="stage-label">${s.label}</span>
+      <span class="stage-spinner"></span>
+    </li>`
+  ).join('');
+
+  $('#loaderSkeletons').innerHTML = Array.from({ length: 3 })
+    .map(() => '<div class="skeleton-row"></div>')
+    .join('');
+}
+
+function updateStage({ stage, label, pct, detail }) {
+  const items = $$('#stagesList .stage-item');
+  let reached = false;
+  items.forEach((item) => {
+    const isCurrent = item.dataset.stage === stage;
+    if (isCurrent) {
+      item.classList.add('active');
+      item.classList.remove('done');
+      reached = true;
+    } else if (!reached) {
+      item.classList.remove('active');
+      item.classList.add('done');
+      item.querySelector('.stage-dot').textContent = '✓';
+    } else {
+      item.classList.remove('active', 'done');
+    }
+  });
+
+  if (typeof pct === 'number') {
+    const p = Math.round(pct * 100);
+    $('#progressFill').style.width = p + '%';
+    $('#orbPct').textContent = p + '%';
+  }
+
+  // rotating status text
+  clearInterval(statusTimer);
+  const pool = STATUS_TEXT[stage] || [label];
+  let idx = 0;
+  $('#loaderStatus').textContent = detail || pool[0];
+  statusTimer = setInterval(() => {
+    idx = (idx + 1) % pool.length;
+    const el = $('#loaderStatus');
+    el.style.opacity = 0;
+    setTimeout(() => {
+      el.textContent = pool[idx];
+      el.style.opacity = 1;
+    }, 200);
+  }, 1600);
+}
+
+function deliverResults(data) {
+  clearInterval(statusTimer);
+  state.raw = data.results || [];
+  state.priceMin = state.priceMax = null;
+  state.trustedOnly = false;
+  $('#trustedOnly').checked = false;
+  $('#priceMin').value = $('#priceMax').value = '';
+  $$('#sortOptions .sort-opt').forEach((b) => b.classList.remove('active'));
+  $('[data-sort="price"]').classList.add('active');
+  state.sort = 'price';
+
+  renderSummary(data);
+  applyFilters();
+  showView('results');
+}
+
+function renderSummary(data) {
+  const { query, totalDiscovered, returned, sourcesQueried, cached, priceStats } = data;
+  const kindLabel = { account: 'accounts', key: 'game keys', both: 'accounts & keys' }[query.kind];
+  $('#resultsSummary').innerHTML = `
+    Showing <b>${returned}</b> ${kindLabel} for “${query.game}” ·
+    scanned <b>${totalDiscovered}</b> listings across
+    <b>${sourcesQueried.length}</b> supported sources
+    ${cached ? '· <span style="color:var(--gold)">cached</span>' : ''}`;
+
+  if (priceStats) {
+    $('#filterStats').innerHTML = `
+      <div><b>Lowest:</b> $${priceStats.min.toFixed(2)}</div>
+      <div><b>Highest:</b> $${priceStats.max.toFixed(2)}</div>
+      <div><b>Median:</b> $${(+priceStats.median).toFixed(2)}</div>
+      <div><b>Avg seller score:</b> ${priceStats.avgSellerScore}/100</div>`;
+  }
+}
+
+// =================== FILTER + SORT ===================
+function applyFilters() {
+  let list = [...state.raw];
+
+  if (state.trustedOnly) {
+    list = list.filter((l) => l.trustTier === 'trusted' || l.trustTier === 'elite');
+  }
+  if (state.priceMin != null) list = list.filter((l) => l.price >= state.priceMin);
+  if (state.priceMax != null) list = list.filter((l) => l.price <= state.priceMax);
+
+  const sorters = {
+    price: (a, b) => a.price - b.price || b.sellerScore - a.sellerScore,
+    rating: (a, b) => b.sellerScore - a.sellerScore || a.price - b.price,
+    delivery: (a, b) => a.deliveryMinutes - b.deliveryMinutes || a.price - b.price,
+    value: (a, b) => b.valueScore - a.valueScore,
+  };
+  list.sort(sorters[state.sort]);
+
+  state.filtered = list;
+  renderCards(list);
+}
+
+function renderCards(list) {
+  const grid = $('#resultsGrid');
+  const empty = $('#noResults');
+
+  if (list.length === 0) {
+    grid.innerHTML = '';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  grid.innerHTML = list
+    .map((l, i) => cardHTML(l, i))
+    .join('');
+}
+
+function cardHTML(l, i) {
+  const scoreClass = `score-${l.trustTier}`;
+  const tbClass = `tb-${l.trustTier}`;
+  const trustText = {
+    elite: 'Elite Seller',
+    trusted: 'Trusted Seller',
+    standard: 'Standard Seller',
+    caution: 'Use Caution',
+  }[l.trustTier];
+
+  const highlight = l.isCheapest ? 'cheapest' : l.isBestValue ? 'bestvalue' : '';
+  const delivery =
+    l.deliveryMinutes < 1
+      ? 'Instant delivery'
+      : l.deliveryMinutes < 60
+      ? `~${l.deliveryMinutes} min delivery`
+      : `~${Math.round(l.deliveryMinutes / 60)}h delivery`;
+
+  return `
+  <article class="card ${highlight}" style="animation-delay:${Math.min(i * 45, 400)}ms">
+    <div class="card-top">
+      <div class="card-icon" style="background:${l.source.color}22;border-color:${l.source.color}55">
+        ${l.source.icon}
+      </div>
+      <div>
+        <div class="card-site">${l.source.name}</div>
+        <div class="card-access">${formatAccess(l.source.access)} source</div>
+      </div>
+      <span class="card-kind">${l.kind}</span>
+    </div>
+
+    <h3 class="card-title">${escapeHtml(l.title)}</h3>
+
+    <span class="trust-badge ${tbClass}">● ${trustText}</span>
+
+    <div class="card-meta">
+      <div class="card-price">$${l.price.toFixed(2)}<span> ${l.currency}</span></div>
+      <div class="card-score-wrap">
+        <div class="card-score ${scoreClass}">${l.sellerScore}</div>
+        <div class="card-score-label">seller score</div>
+      </div>
+    </div>
+
+    <p class="card-review">${escapeHtml(l.reviewSummary)}</p>
+
+    <div class="card-foot">
+      <span class="card-delivery">⚡ ${delivery}</span>
+      <a class="view-btn" href="${l.url}" target="_blank" rel="noopener noreferrer">
+        View Listing →
+      </a>
+    </div>
+  </article>`;
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
+}
+
+// =================== VIEW SWITCHING ===================
+function showView(name) {
+  ['search', 'loading', 'results'].forEach((v) => {
+    $(`#${v}View`).hidden = v !== name;
+  });
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
